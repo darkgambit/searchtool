@@ -1,0 +1,1045 @@
+Option Explicit
+
+' =====================================================================
+'  ASSET SEARCH ENGINE  -  Serial / Barcode lookup across DB files
+'
+'  * SEARCH opens a folder picker, indexes every Excel workbook found
+'    in that folder (and its sub-folders) and returns every row whose
+'    serial number / barcode matches the value(s) typed in C2.
+'  * Columns pulled into the results are defined by the headers in
+'    row 4 of this sheet (A..F). Edit / reorder them freely.
+'  * Sources with 300,000+ rows are supported: each needed column is
+'    read once, cached in memory, and re-used on the next search.
+'  * CLEAR wipes the results, the input box and the status line.
+' =====================================================================
+
+Private Const HDR_ROW       As Long = 4
+Private Const FIRST_ROW     As Long = 5
+Private Const LAST_TOOL_COL As Long = 6
+Private Const SRC_COL       As Long = 7
+Private Const INPUT_CELL    As String = "C2"
+Private Const STATUS_CELL   As String = "A3"
+
+Private Const MAX_RESULTS   As Long = 200000
+Private Const MAX_FILES     As Long = 500
+Private Const MAX_DEPTH     As Long = 3
+Private Const HIT_CHUNK     As Long = 8192
+
+' Header names (normalised) that a search term is compared against.
+Private Const KEY_CANON As String = "|@SERIAL|@ASSET|@BARCODE|"
+
+Private Type FileData
+    path        As String
+    stamp       As String
+    RowCount    As Long
+    KeyBlocks() As Long
+    KeyKind()   As String
+    OutBlocks() As Long
+    Cols()      As Variant
+End Type
+
+Private mFiles(1 To MAX_FILES) As FileData
+Private mFileCount As Long
+Private mLoadErrors As String
+
+Private mHitSlot() As Long
+Private mHitRow() As Long
+Private mHitCap As Long
+Private mHitCount As Long
+Private mHitPerFile(1 To MAX_FILES) As Long
+Private mTruncated As Boolean
+
+Private mNumTerm() As Double
+Private mNumValid() As Boolean
+Private mNumCount As Long
+
+Private mOutRows() As Variant
+Private mOutCount As Long
+Private mOutCap As Long
+
+
+' ---------------------------------------------------------------------
+'  BUTTON MACROS
+' ---------------------------------------------------------------------
+Public Sub RunSearch()
+    Dim folder As String
+
+    On Error GoTo fail
+
+    folder = PickFolder()
+    If Len(folder) = 0 Then Exit Sub
+    SearchInFolder folder
+    Exit Sub
+
+fail:
+    MsgBox "Search failed:" & vbCrLf & Err.Description, vbCritical, "Search"
+End Sub
+
+
+Public Sub ClearResults()
+    Dim ws As Worksheet
+
+    On Error GoTo fail
+
+    Set ws = SearchSheet()
+    Application.ScreenUpdating = False
+    ClearResultsArea ws
+    ws.Range(INPUT_CELL).ClearContents
+    SetStatus "Ready.  Type a serial number or barcode in " & INPUT_CELL & ", then click SEARCH."
+    Application.ScreenUpdating = True
+    ws.Range(INPUT_CELL).Select
+    Exit Sub
+
+fail:
+    Application.ScreenUpdating = True
+    SetStatus "Clear failed: " & Err.Description
+End Sub
+
+
+' ---------------------------------------------------------------------
+'  CORE SEARCH  (also callable with a path, e.g. for testing)
+' ---------------------------------------------------------------------
+Public Sub SearchInFolder(ByVal folderPath As String)
+    Dim ws As Worksheet
+    Dim terms() As String
+    Dim paths() As String
+    Dim nPaths As Long, i As Long, sl As Long, hits As Long
+    Dim t As Single
+    Dim partialUsed As Boolean
+    Dim counts As String, msg As String
+
+    On Error GoTo fail
+
+    Set ws = SearchSheet()
+    If Right$(folderPath, 1) <> "\" Then folderPath = folderPath & "\"
+
+    terms = ParseTerms(ws.Range(INPUT_CELL).Value)
+    BuildNumericTerms terms
+    If UBound(terms) < 0 Then
+        MsgBox "Type at least one serial number or barcode in cell " & INPUT_CELL & ".", _
+               vbExclamation, "Nothing to search"
+        ws.Range(INPUT_CELL).Select
+        Exit Sub
+    End If
+
+    nPaths = ListWorkbooks(folderPath, paths)
+    If nPaths = 0 Then
+        MsgBox "No Excel workbooks were found in:" & vbCrLf & folderPath, _
+               vbExclamation, "No data files"
+        Exit Sub
+    End If
+
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.Calculation = xlCalculationManual
+    Application.Cursor = xlWait
+    SetStatus "Indexing " & nPaths & " workbook(s) ..."
+
+    t = Timer
+    mLoadErrors = ""
+    mHitCount = 0
+    mHitCap = 0
+    mOutCount = 0
+    mOutCap = 0
+    mTruncated = False
+    Erase mHitSlot
+    Erase mHitRow
+    Erase mHitPerFile
+    Erase mOutRows
+
+    ClearResultsArea ws
+
+    ' ---- index every workbook once (cached between searches) ----
+    For i = 1 To nPaths
+        Application.StatusBar = "Indexing " & FileNameOf(paths(i)) & "  (" & i & " of " & nPaths & ")"
+        sl = EnsureFileLoaded(paths(i))
+        If sl = 0 Then mLoadErrors = AddErr(mLoadErrors, FileNameOf(paths(i)))
+    Next i
+
+    ' ---- exact match pass ----
+    For i = 1 To nPaths
+        sl = SlotOf(paths(i))
+        If sl > 0 Then hits = hits + CollectMatches(sl, terms, False)
+    Next i
+
+    ' ---- if nothing matched exactly, retry as "contains" ----
+    If mHitCount = 0 Then
+        For i = 1 To nPaths
+            sl = SlotOf(paths(i))
+            If sl > 0 Then hits = hits + CollectMatches(sl, terms, True)
+        Next i
+        partialUsed = (mHitCount > 0)
+    End If
+
+    For i = 1 To nPaths
+        sl = SlotOf(paths(i))
+        If sl > 0 Then
+            If mHitPerFile(sl) > 0 Then
+                counts = counts & IIf(Len(counts) > 0, "   |   ", "") & _
+                         FileNameOf(mFiles(sl).path) & ": " & Format$(mHitPerFile(sl), "#,##0")
+            End If
+        End If
+    Next i
+
+    If mHitCount > 0 Then Call MergeHits
+    If mOutCount > 0 Then Call BuildResults(ws)
+
+    ' ---- report ----
+    If mOutCount = 0 Then
+        msg = "No match for " & Join(terms, ", ") & "  |  scanned " & nPaths & " workbook(s)"
+    Else
+        msg = Format$(mOutCount, "#,##0") & " row(s) for " & Join(terms, ", ")
+        If mHitCount <> mOutCount Then msg = msg & " (from " & Format$(mHitCount, "#,##0") & " match(es) combined)"
+        If Len(counts) > 0 Then msg = msg & "   |   " & counts
+        If partialUsed Then msg = msg & "   |   partial matches (no exact hit)"
+        If mTruncated Then msg = msg & "   |   limited to first " & Format$(MAX_RESULTS, "#,##0") & " rows"
+    End If
+    msg = msg & "   |   " & Format$(Timer - t, "0.0") & "s"
+    If Len(mLoadErrors) > 0 Then msg = msg & "   |   skipped: " & mLoadErrors
+
+    Application.Cursor = xlDefault
+    Application.Calculation = xlCalculationAutomatic
+    Application.EnableEvents = True
+    Application.ScreenUpdating = True
+    Application.StatusBar = False
+    SetStatus msg
+    If mOutCount > 0 Then ws.Cells(FIRST_ROW, 1).Select
+    Exit Sub
+
+fail:
+    Application.Cursor = xlDefault
+    Application.Calculation = xlCalculationAutomatic
+    Application.EnableEvents = True
+    Application.ScreenUpdating = True
+    Application.StatusBar = False
+    SetStatus "Search failed: " & Err.Description
+    MsgBox "Search failed:" & vbCrLf & Err.Description, vbCritical, "Search"
+End Sub
+
+
+' ---------------------------------------------------------------------
+'  FOLDER PICKER
+' ---------------------------------------------------------------------
+Private Function PickFolder() As String
+    With Application.FileDialog(4)          ' 4 = msoFileDialogFolderPicker
+        .Title = "Select the folder that contains DB1, DB2, ..."
+        .ButtonName = "Search this folder"
+        .AllowMultiSelect = False
+        If .Show <> -1 Then Exit Function
+        PickFolder = .SelectedItems(1)
+    End With
+End Function
+
+
+' ---------------------------------------------------------------------
+'  MATCHING
+' ---------------------------------------------------------------------
+Private Function CollectMatches(ByVal slot As Long, ByRef terms() As String, _
+                                ByVal partial As Boolean) As Long
+    Dim r As Long, b As Long, hits As Long, nKeys As Long
+
+    If mFiles(slot).RowCount <= 0 Then Exit Function
+    nKeys = UBound(mFiles(slot).KeyBlocks)
+
+    For r = 1 To mFiles(slot).RowCount
+        For b = 1 To nKeys
+            If HitTest(mFiles(slot).Cols(mFiles(slot).KeyBlocks(b)), r, terms, partial) Then
+                If mHitCount < MAX_RESULTS Then
+                    AddHit slot, r
+                    hits = hits + 1
+                Else
+                    mTruncated = True
+                End If
+                Exit For
+            End If
+        Next b
+    Next r
+
+    CollectMatches = hits
+End Function
+
+
+Private Function HitTest(ByRef colArr As Variant, ByVal r As Long, _
+                         ByRef terms() As String, ByVal partial As Boolean) As Boolean
+    Dim v As Variant, k As String, i As Long, t As String
+
+    v = colArr(r, 1)
+    If IsEmpty(v) Then Exit Function
+    If IsError(v) Then Exit Function
+    If IsNull(v) Then Exit Function
+
+    Select Case VarType(v)
+        Case vbInteger, vbLong, vbSingle, vbDouble, vbCurrency, vbDecimal
+            ' fast path: compare numbers directly (no string work)
+            For i = 1 To mNumCount
+                If mNumValid(i) Then
+                    If v = mNumTerm(i) Then
+                        HitTest = True
+                        Exit Function
+                    End If
+                End If
+            Next i
+            k = CStr(v)
+            If InStr(k, ".") > 0 Then k = Format$(v, "0")
+        Case vbDate
+            k = Format$(v, "yyyymmdd")
+        Case Else
+            k = CStr(v)
+    End Select
+
+    k = UCase$(Trim$(k))
+    If InStr(k, " ") > 0 Then k = Replace(k, " ", "")
+    If Len(k) = 0 Then Exit Function
+
+    For i = LBound(terms) To UBound(terms)
+        t = terms(i)
+        If Len(t) = 0 Then
+            ' skip blank term
+        ElseIf partial Then
+            If Len(t) >= 3 Then
+                If InStr(1, k, t, vbBinaryCompare) > 0 Then
+                    HitTest = True
+                    Exit Function
+                End If
+            End If
+        ElseIf StrComp(k, t, vbBinaryCompare) = 0 Then
+            HitTest = True
+            Exit Function
+        End If
+    Next i
+End Function
+
+
+Private Sub BuildNumericTerms(ByRef terms() As String)
+    Dim i As Long, n As Long
+
+    n = 0
+    If UBound(terms) >= LBound(terms) Then n = UBound(terms) - LBound(terms) + 1
+    mNumCount = 0
+    If n <= 0 Then Exit Sub
+
+    ReDim mNumTerm(1 To n)
+    ReDim mNumValid(1 To n)
+    mNumCount = n
+    For i = 1 To n
+        If IsNumeric(terms(LBound(terms) + i - 1)) Then
+            mNumTerm(i) = CDbl(terms(LBound(terms) + i - 1))
+            mNumValid(i) = True
+        End If
+    Next i
+End Sub
+
+
+Private Sub AddHit(ByVal slot As Long, ByVal r As Long)
+    If mHitCount >= mHitCap Then
+        mHitCap = mHitCap + HIT_CHUNK
+        ReDim Preserve mHitSlot(1 To mHitCap)
+        ReDim Preserve mHitRow(1 To mHitCap)
+    End If
+    mHitCount = mHitCount + 1
+    mHitSlot(mHitCount) = slot
+    mHitRow(mHitCount) = r
+    mHitPerFile(slot) = mHitPerFile(slot) + 1
+End Sub
+
+
+' ---------------------------------------------------------------------
+'  RESULTS OUTPUT
+' ---------------------------------------------------------------------
+Private Sub MergeHits()
+    Dim i As Long, c As Long, b As Long, sl As Long, r As Long
+    Dim id As String, gkey As String, skey As String, fname As String
+    Dim occ As Long, idx As Long
+    Dim rowArr As Variant
+    Dim groupMap As Collection, occMap As Collection
+    Dim mergeOcc As Boolean
+
+    mOutCount = 0
+    mOutCap = 0
+    Erase mOutRows
+    If mHitCount = 0 Then Exit Sub
+
+    Set groupMap = New Collection
+    Set occMap = New Collection
+    mergeOcc = (mHitCount <= 20000)
+
+    Dim rank As Long
+
+    For rank = 0 To 2
+    For i = 1 To mHitCount
+        sl = mHitSlot(i)
+        If FileRank(mFiles(sl).path) <> rank Then GoTo nextHit
+        r = mHitRow(i)
+
+        id = IdentityOf(sl, r)
+        If Len(id) = 0 Then id = "R:" & sl & ":" & r
+
+        occ = 1
+        If mergeOcc Then
+            skey = id & "|" & CStr(sl)
+            occ = GroupCount(occMap, skey) + 1
+            GroupPut occMap, skey, occ
+        End If
+        gkey = id & "#" & CStr(occ)
+
+        idx = GroupIndex(groupMap, gkey)
+        If idx = 0 Then
+            rowArr = BlankRow()
+            PushRow rowArr
+            idx = mOutCount
+            GroupPut groupMap, gkey, idx
+        Else
+            rowArr = mOutRows(idx)
+        End If
+
+        ' overlay: only fill columns that are still empty
+        For c = 1 To LAST_TOOL_COL
+            If IsBlank(rowArr(c)) Then
+                b = mFiles(sl).OutBlocks(c)
+                If b > 0 Then rowArr(c) = SafeVal(CellOf(mFiles(sl).Cols(b), r))
+            End If
+        Next c
+
+        fname = FileNameOf(mFiles(sl).path)
+        If InStr(1, CStr(rowArr(SRC_COL)), fname, vbTextCompare) = 0 Then
+            If IsBlank(rowArr(SRC_COL)) Then
+                rowArr(SRC_COL) = fname
+            Else
+                rowArr(SRC_COL) = CStr(rowArr(SRC_COL)) & " + " & fname
+            End If
+        End If
+
+        mOutRows(idx) = rowArr
+nextHit:
+    Next i
+    Next rank
+End Sub
+
+
+Private Function FileRank(ByVal path As String) As Long
+    Dim n As String
+    n = UCase$(FileNameOf(path))
+    If InStr(1, n, "DB1", vbBinaryCompare) > 0 Then
+        FileRank = 0
+    ElseIf InStr(1, n, "DB2", vbBinaryCompare) > 0 Then
+        FileRank = 1
+    Else
+        FileRank = 2
+    End If
+End Function
+
+
+Private Function IdentityOf(ByVal slot As Long, ByVal r As Long) As String
+    Dim pass As Long, b As Long, kind As String, v As String
+
+    For pass = 0 To 2
+        For b = 1 To UBound(mFiles(slot).KeyBlocks)
+            kind = mFiles(slot).KeyKind(b)
+            If (pass = 0 And kind = "@SERIAL") Or _
+               (pass = 1 And kind = "@ASSET") Or _
+               (pass = 2 And kind = "@BARCODE") Then
+                v = NormalizeKey(CellOf(mFiles(slot).Cols(mFiles(slot).KeyBlocks(b)), r))
+                If Len(v) > 0 Then
+                    IdentityOf = Left$(kind, 2) & ":" & v
+                    Exit Function
+                End If
+            End If
+        Next b
+    Next pass
+End Function
+
+
+Private Function BlankRow() As Variant
+    Dim a() As Variant, c As Long
+    ReDim a(1 To SRC_COL)
+    For c = 1 To SRC_COL
+        a(c) = Empty
+    Next c
+    BlankRow = a
+End Function
+
+
+Private Sub PushRow(ByVal rowArr As Variant)
+    If mOutCount >= mOutCap Then
+        mOutCap = mOutCap + 512
+        ReDim Preserve mOutRows(1 To mOutCap)
+    End If
+    mOutCount = mOutCount + 1
+    mOutRows(mOutCount) = rowArr
+End Sub
+
+
+Private Function GroupCount(ByRef map As Collection, ByVal key As String) As Long
+    Dim v As Variant
+    On Error Resume Next
+    v = map(key)
+    On Error GoTo 0
+    If IsEmpty(v) Then GroupCount = 0 Else GroupCount = CLng(v)
+End Function
+
+
+Private Function GroupIndex(ByRef map As Collection, ByVal key As String) As Long
+    Dim v As Variant
+    On Error Resume Next
+    v = map(key)
+    On Error GoTo 0
+    If IsEmpty(v) Then GroupIndex = 0 Else GroupIndex = CLng(v)
+End Function
+
+
+Private Sub GroupPut(ByRef map As Collection, ByVal key As String, ByVal val As Long)
+    On Error Resume Next
+    map.Remove key
+    map.Add val, key
+    On Error GoTo 0
+End Sub
+
+
+Private Function IsBlank(ByVal v As Variant) As Boolean
+    If IsEmpty(v) Then
+        IsBlank = True
+    ElseIf IsNull(v) Then
+        IsBlank = True
+    ElseIf VarType(v) = vbString Then
+        IsBlank = (Len(Trim$(CStr(v))) = 0)
+    End If
+End Function
+
+
+Private Sub BuildResults(ByRef ws As Worksheet)
+    Dim outArr() As Variant
+    Dim i As Long, c As Long
+    Dim rowArr As Variant
+
+    If mOutCount = 0 Then Exit Sub
+
+    ReDim outArr(1 To mOutCount, 1 To SRC_COL)
+    For i = 1 To mOutCount
+        rowArr = mOutRows(i)
+        For c = 1 To SRC_COL
+            outArr(i, c) = rowArr(c)
+        Next c
+    Next i
+
+    ws.Cells(FIRST_ROW, 1).Resize(mOutCount, SRC_COL).Value = outArr
+    FormatResults ws, FIRST_ROW + mOutCount - 1, mOutCount
+End Sub
+
+
+Private Sub FormatResults(ByRef ws As Worksheet, ByVal lastRow As Long, ByVal nRows As Long)
+    Dim c As Long, r As Long, lbl As String
+
+    With ws.Range(ws.Cells(FIRST_ROW, 1), ws.Cells(lastRow, SRC_COL))
+        .Font.name = "Calibri"
+        .Font.Size = 10
+        .Borders.LineStyle = xlContinuous
+        .Borders.Color = RGB(217, 217, 217)
+        .Borders.Weight = xlThin
+        .VerticalAlignment = xlCenter
+    End With
+
+    If nRows <= 5000 Then
+        For r = FIRST_ROW To lastRow
+            If (r - FIRST_ROW) Mod 2 = 1 Then
+                ws.Range(ws.Cells(r, 1), ws.Cells(r, SRC_COL)).Interior.Color = RGB(242, 242, 242)
+            End If
+        Next r
+    End If
+
+    ' date-formatted columns (any tool header containing "DATE")
+    For c = 1 To LAST_TOOL_COL
+        lbl = NormalizeHeader(ws.Cells(HDR_ROW, c).Value)
+        If InStr(1, lbl, "DATE", vbBinaryCompare) > 0 Then
+            ws.Range(ws.Cells(FIRST_ROW, c), ws.Cells(lastRow, c)).NumberFormat = "mm/dd/yyyy"
+            ws.Range(ws.Cells(FIRST_ROW, c), ws.Cells(lastRow, c)).HorizontalAlignment = xlCenter
+        End If
+    Next c
+
+End Sub
+
+
+Private Sub ClearResultsArea(ByRef ws As Worksheet)
+    Dim lastRow As Long
+    On Error Resume Next
+    lastRow = ws.Cells(ws.Rows.Count, SRC_COL).End(xlUp).Row
+    On Error GoTo 0
+    If lastRow < FIRST_ROW Then lastRow = FIRST_ROW
+    ws.Range(ws.Cells(FIRST_ROW, 1), ws.Cells(lastRow, SRC_COL)).Clear
+End Sub
+
+
+' ---------------------------------------------------------------------
+'  SOURCE WORKBOOK INDEXING
+' ---------------------------------------------------------------------
+Private Function EnsureFileLoaded(ByVal path As String) As Long
+    Dim i As Long, stamp As String
+
+    stamp = FileStamp(path)
+    If Len(stamp) = 0 Then Exit Function
+
+    For i = 1 To mFileCount
+        If StrComp(mFiles(i).path, path, vbTextCompare) = 0 Then
+            If mFiles(i).stamp = stamp Then
+                EnsureFileLoaded = i
+                Exit Function
+            End If
+            ResetSlot i
+            If LoadInto(i, path, stamp) Then EnsureFileLoaded = i
+            Exit Function
+        End If
+    Next i
+
+    If mFileCount >= MAX_FILES Then Exit Function
+    If LoadInto(mFileCount + 1, path, stamp) Then
+        mFileCount = mFileCount + 1
+        EnsureFileLoaded = mFileCount
+    End If
+End Function
+
+
+Private Function SlotOf(ByVal path As String) As Long
+    Dim i As Long
+    For i = 1 To mFileCount
+        If StrComp(mFiles(i).path, path, vbTextCompare) = 0 Then
+            SlotOf = i
+            Exit Function
+        End If
+    Next i
+End Function
+
+
+Private Sub ResetSlot(ByVal slot As Long)
+    Erase mFiles(slot).KeyBlocks
+    Erase mFiles(slot).KeyKind
+    Erase mFiles(slot).OutBlocks
+    Erase mFiles(slot).Cols
+    mFiles(slot).path = ""
+    mFiles(slot).stamp = ""
+    mFiles(slot).RowCount = 0
+End Sub
+
+
+Private Function LoadInto(ByVal slot As Long, ByVal path As String, ByVal stamp As String) As Boolean
+    Dim wb As Workbook, wsh As Worksheet, wsTool As Worksheet
+    Dim hdrRow As Long, lastRow As Long, lastCol As Long
+    Dim c As Long, i As Long, j As Long, k As Long
+    Dim normArr() As String, keySrc() As Long, toolSrc() As Long
+    Dim blockOf() As Long, need() As Long
+    Dim nKeys As Long, nNeed As Long
+    Dim want As String
+    Dim fd As FileData
+
+    On Error GoTo badfile
+
+    Set wsTool = SearchSheet()
+    Set wb = Workbooks.Open(Filename:=path, ReadOnly:=True, UpdateLinks:=0, _
+                            IgnoreReadOnlyRecommended:=True, AddToMru:=False)
+
+    hdrRow = 0
+    For Each wsh In wb.Worksheets
+        hdrRow = FindHeaderRow(wsh)
+        If hdrRow > 0 Then Exit For
+    Next wsh
+    If hdrRow = 0 Then GoTo skipfile
+
+    lastCol = wsh.UsedRange.Column + wsh.UsedRange.Columns.Count - 1
+    If lastCol > 300 Then lastCol = 300
+    lastRow = wsh.UsedRange.Row + wsh.UsedRange.Rows.Count - 1
+    If lastCol < 2 Then GoTo skipfile
+
+    If lastRow - hdrRow < 1 Then
+        ' header-only workbook (e.g. another copy of this template)
+        fd.path = path
+        fd.stamp = stamp
+        fd.RowCount = 0
+        mFiles(slot) = fd
+        wb.Close SaveChanges:=False
+        Set wb = Nothing
+        LoadInto = True
+        Exit Function
+    End If
+
+    ReDim normArr(1 To lastCol)
+    For c = 1 To lastCol
+        normArr(c) = NormalizeHeader(wsh.Cells(hdrRow, c).Value)
+    Next c
+
+    ' ---- search-key columns ----
+    ReDim keySrc(1 To lastCol)
+    nKeys = 0
+    For c = 1 To lastCol
+        If Len(normArr(c)) > 0 Then
+            If InStr(1, KEY_CANON, "|" & CanonicalHeader(normArr(c)) & "|", vbBinaryCompare) > 0 Then
+                nKeys = nKeys + 1
+                keySrc(nKeys) = c
+            End If
+        End If
+    Next c
+    If nKeys = 0 Then GoTo skipfile
+
+    ' ---- tool columns -> source columns ----
+    ReDim toolSrc(1 To LAST_TOOL_COL)
+    For c = 1 To LAST_TOOL_COL
+        toolSrc(c) = 0
+        want = NormalizeHeader(wsTool.Cells(HDR_ROW, c).Value)
+        If Len(want) > 0 Then
+            want = CanonicalHeader(want)
+            For j = 1 To lastCol
+                If CanonicalHeader(normArr(j)) = want Then
+                    toolSrc(c) = j
+                    Exit For
+                End If
+            Next j
+        End If
+    Next c
+
+    ' ---- unique list of columns to cache ----
+    ReDim blockOf(1 To lastCol)
+    ReDim need(1 To nKeys + LAST_TOOL_COL)
+    nNeed = 0
+    For i = 1 To nKeys
+        If blockOf(keySrc(i)) = 0 Then
+            nNeed = nNeed + 1
+            need(nNeed) = keySrc(i)
+            blockOf(keySrc(i)) = nNeed
+        End If
+    Next i
+    For c = 1 To LAST_TOOL_COL
+        If toolSrc(c) > 0 Then
+            If blockOf(toolSrc(c)) = 0 Then
+                nNeed = nNeed + 1
+                need(nNeed) = toolSrc(c)
+                blockOf(toolSrc(c)) = nNeed
+            End If
+        End If
+    Next c
+
+    ' ---- read the columns into memory ----
+    fd.path = path
+    fd.stamp = stamp
+    fd.RowCount = lastRow - hdrRow
+
+    ReDim fd.Cols(1 To nNeed)
+    For k = 1 To nNeed
+        Application.StatusBar = "Reading " & FileNameOf(path) & "  column " & k & " of " & nNeed
+        fd.Cols(k) = ReadColumn(wsh, hdrRow + 1, lastRow, need(k))
+    Next k
+
+    ReDim fd.KeyBlocks(1 To nKeys)
+    ReDim fd.KeyKind(1 To nKeys)
+    For i = 1 To nKeys
+        fd.KeyBlocks(i) = blockOf(keySrc(i))
+        fd.KeyKind(i) = CanonicalHeader(normArr(keySrc(i)))
+    Next i
+
+    ReDim fd.OutBlocks(1 To LAST_TOOL_COL)
+    For c = 1 To LAST_TOOL_COL
+        If toolSrc(c) > 0 Then fd.OutBlocks(c) = blockOf(toolSrc(c))
+    Next c
+
+    mFiles(slot) = fd
+
+    wb.Close SaveChanges:=False
+    Set wb = Nothing
+    LoadInto = True
+    Exit Function
+
+skipfile:
+    wb.Close SaveChanges:=False
+    Set wb = Nothing
+    Exit Function
+
+badfile:
+    On Error Resume Next
+    If Not wb Is Nothing Then wb.Close SaveChanges:=False
+    LoadInto = False
+End Function
+
+
+Private Function ReadColumn(ByRef wsh As Worksheet, ByVal firstRow As Long, _
+                            ByVal lastRow As Long, ByVal col As Long) As Variant
+    Dim out() As Variant
+
+    If lastRow <= firstRow Then
+        ReDim out(1 To 1, 1 To 1)
+        out(1, 1) = wsh.Cells(firstRow, col).Value2
+        ReadColumn = out
+        Exit Function
+    End If
+
+    ReadColumn = wsh.Range(wsh.Cells(firstRow, col), wsh.Cells(lastRow, col)).Value2
+End Function
+
+
+Private Function FindHeaderRow(ByRef wsh As Worksheet) As Long
+    Dim r As Long, c As Long, lastCol As Long
+    Dim keyHits As Long, filled As Long, norm As String
+
+    On Error Resume Next
+    lastCol = wsh.UsedRange.Column + wsh.UsedRange.Columns.Count - 1
+    On Error GoTo 0
+
+    If lastCol < 2 Then Exit Function
+    If lastCol > 120 Then lastCol = 120
+
+    For r = 1 To 15
+        keyHits = 0
+        filled = 0
+        For c = 1 To lastCol
+            norm = NormalizeHeader(wsh.Cells(r, c).Value)
+            If Len(norm) > 0 Then
+                filled = filled + 1
+                If InStr(1, KEY_CANON, "|" & CanonicalHeader(norm) & "|", vbBinaryCompare) > 0 Then keyHits = keyHits + 1
+            End If
+        Next c
+        If keyHits >= 2 And filled >= 3 Then
+            FindHeaderRow = r
+            Exit Function
+        End If
+    Next r
+End Function
+
+
+' ---------------------------------------------------------------------
+'  FILE / FOLDER SCANNING
+' ---------------------------------------------------------------------
+Private Function ListWorkbooks(ByVal root As String, ByRef paths() As String) As Long
+    Dim folders() As String, nFolders As Long
+    Dim i As Long, n As Long
+    Dim f As String, full As String
+
+    ReDim folders(1 To 64)
+    folders(1) = root
+    nFolders = 1
+    CollectSubFolders root, folders, nFolders, 1
+
+    ReDim paths(1 To 64)
+    n = 0
+    For i = 1 To nFolders
+        f = Dir$(folders(i) & "*.*", vbNormal)
+        Do While Len(f) > 0
+            If IsDataFile(f) Then
+                full = folders(i) & f
+                If StrComp(full, ThisWorkbook.FullName, vbTextCompare) <> 0 Then
+                    n = n + 1
+                    If n > UBound(paths) Then ReDim Preserve paths(1 To n + 63)
+                    paths(n) = full
+                End If
+            End If
+            f = Dir$
+        Loop
+    Next i
+    ListWorkbooks = n
+End Function
+
+
+Private Sub CollectSubFolders(ByVal path As String, ByRef folders() As String, _
+                              ByRef nFolders As Long, ByVal depth As Long)
+    Dim d As String, full As String, att As Long, i As Long
+    Dim subs() As String, nSubs As Long
+
+    If depth > MAX_DEPTH Then Exit Sub
+
+    ReDim subs(1 To 32)
+    nSubs = 0
+    d = Dir$(path & "*", vbDirectory)
+    Do While Len(d) > 0
+        If Left$(d, 1) <> "." Then
+            att = 0
+            On Error Resume Next
+            att = GetAttr(path & d)
+            On Error GoTo 0
+            If (att And vbDirectory) <> 0 Then
+                nSubs = nSubs + 1
+                If nSubs > UBound(subs) Then ReDim Preserve subs(1 To UBound(subs) + 16)
+                subs(nSubs) = d
+            End If
+        End If
+        d = Dir$
+    Loop
+
+    For i = 1 To nSubs
+        full = path & subs(i) & "\"
+        nFolders = nFolders + 1
+        If nFolders > UBound(folders) Then ReDim Preserve folders(1 To UBound(folders) + 32)
+        folders(nFolders) = full
+        CollectSubFolders full, folders, nFolders, depth + 1
+    Next i
+End Sub
+
+
+Private Function IsDataFile(ByVal name As String) As Boolean
+    Dim ext As String
+    Dim p As Long
+
+    If Left$(name, 2) = "~$" Then Exit Function
+    p = InStrRev(name, ".")
+    If p = 0 Then Exit Function
+    ext = LCase$(Mid$(name, p + 1))
+    Select Case ext
+        Case "xls", "xlsx", "xlsm", "xlsb", "xltx", "xltm"
+            IsDataFile = True
+    End Select
+End Function
+
+
+Private Function FileStamp(ByVal path As String) As String
+    Dim d As Date, s As Long
+
+    On Error Resume Next
+    d = FileDateTime(path)
+    s = FileLen(path)
+    If Err.Number <> 0 Then Exit Function
+    On Error GoTo 0
+    FileStamp = Format$(d, "yyyymmddhhnnss") & "-" & s
+End Function
+
+
+' ---------------------------------------------------------------------
+'  SMALL HELPERS
+' ---------------------------------------------------------------------
+Private Function ParseTerms(ByVal v As Variant) As String()
+    Dim raw As String, parts() As String, out() As String
+    Dim i As Long, n As Long, t As String
+
+    If IsError(v) Then v = ""
+    If IsEmpty(v) Then v = ""
+    raw = Replace(Replace(Replace(CStr(v), vbCrLf, ","), vbLf, ","), ";", ",")
+    parts = Split(raw, ",")
+
+    ReDim out(LBound(parts) To UBound(parts))
+    n = LBound(parts) - 1
+    For i = LBound(parts) To UBound(parts)
+        t = NormalizeKey(parts(i))
+        If Len(t) > 0 Then
+            n = n + 1
+            out(n) = t
+        End If
+    Next i
+
+    If n < 0 Then
+        ParseTerms = Array()
+        Exit Function
+    End If
+
+    ReDim Preserve out(LBound(parts) To n)
+    ParseTerms = out
+End Function
+
+
+
+Private Function CanonicalHeader(ByVal norm As String) As String
+    Select Case norm
+        Case "SERIALNUMBER", "SERIALNO", "SERIAL", "SERIALNUMBERNO"
+            CanonicalHeader = "@SERIAL"
+        Case "ASSET", "ASSETNUMBER", "ASSETNO", "ASSETCODE", _
+             "OLDBARCODEASSETNUMBERFROMGSG", "OLDBARCODE"
+            CanonicalHeader = "@ASSET"
+        Case "BARCODE", "BARCODENUMBER", "BARCODENO"
+            CanonicalHeader = "@BARCODE"
+        Case Else
+            CanonicalHeader = norm
+    End Select
+End Function
+
+
+Private Function NormalizeKey(ByVal v As Variant) As String
+    Dim s As String
+
+    If IsError(v) Then Exit Function
+    If IsEmpty(v) Then Exit Function
+    If IsNull(v) Then Exit Function
+
+    Select Case VarType(v)
+        Case vbInteger, vbLong, vbSingle, vbDouble, vbCurrency, vbDecimal
+            If v = Int(v) Then
+                s = Format$(v, "0")
+            Else
+                s = CStr(v)
+            End If
+        Case Else
+            s = CStr(v)
+    End Select
+
+    s = Replace(s, " ", "")
+    s = Replace(s, vbTab, "")
+    s = UCase$(Trim$(s))
+    If Left$(s, 1) = "'" Then s = Mid$(s, 2)
+    NormalizeKey = s
+End Function
+
+
+Private Function NormalizeHeader(ByVal v As Variant) As String
+    Dim s As String
+
+    If IsError(v) Then Exit Function
+    If IsEmpty(v) Then Exit Function
+    If IsNull(v) Then Exit Function
+
+    s = UCase$(Trim$(CStr(v)))
+    s = Replace(s, " ", "")
+    s = Replace(s, "_", "")
+    s = Replace(s, ".", "")
+    s = Replace(s, "-", "")
+    s = Replace(s, "(", "")
+    s = Replace(s, ")", "")
+    s = Replace(s, "/", "")
+    s = Replace(s, "#", "")
+    s = Replace(s, vbLf, "")
+    s = Replace(s, vbCr, "")
+    s = Replace(s, vbTab, "")
+    NormalizeHeader = s
+End Function
+
+
+Private Function SafeVal(ByVal v As Variant) As Variant
+    If IsError(v) Then
+        SafeVal = ""
+    ElseIf IsNull(v) Then
+        SafeVal = ""
+    Else
+        SafeVal = v
+    End If
+End Function
+
+
+Private Function CellOf(ByRef colArr As Variant, ByVal r As Long) As Variant
+    CellOf = colArr(r, 1)
+End Function
+
+
+Private Function FileNameOf(ByVal p As String) As String
+    Dim i As Long
+    i = InStrRev(p, "\")
+    If i > 0 Then FileNameOf = Mid$(p, i + 1) Else FileNameOf = p
+End Function
+
+
+Private Function AddErr(ByVal current As String, ByVal name As String) As String
+    If Len(current) >= 160 Then
+        AddErr = current
+    ElseIf Len(current) = 0 Then
+        AddErr = name
+    Else
+        AddErr = current & ", " & name
+    End If
+End Function
+
+
+Private Function SearchSheet() As Worksheet
+    Dim ws As Worksheet
+
+    On Error Resume Next
+    Set ws = ThisWorkbook.Worksheets("SEARCH")
+    On Error GoTo 0
+    If ws Is Nothing Then Set ws = ThisWorkbook.Worksheets(1)
+    Set SearchSheet = ws
+End Function
+
+
+Private Sub SetStatus(ByVal msg As String)
+    On Error Resume Next
+    SearchSheet.Range(STATUS_CELL).Value = msg
+End Sub
+
+
